@@ -1,1 +1,5 @@
-
+numpy
+pandas
+logging
+streamlit
+plotly
