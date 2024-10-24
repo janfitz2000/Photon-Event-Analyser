@@ -18,10 +18,8 @@ import streamlit as st
 from io import BytesIO
 import plotly.express as px
 import plotly.graph_objects as go
-import time
-from threading import Thread
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from scipy.stats import iqr  # For Interquartile Range
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -61,6 +59,28 @@ devices = {
 # Function Definitions
 # ---------------------------
 
+def get_time_unit(intervals_ps, selected_unit):
+    """
+    Scales intervals to the selected unit.
+
+    Parameters:
+        intervals_ps (np.ndarray): Array of intervals in picoseconds.
+        selected_unit (str): Selected time unit.
+
+    Returns:
+        np.ndarray: Scaled intervals.
+        str: Unit label.
+    """
+    unit_scaling = {
+        'ps': 1,
+        'ns': 1e-3,
+        'μs': 1e-6,
+        'ms': 1e-9,
+        's': 1e-12
+    }
+    scaled_intervals = intervals_ps * unit_scaling[selected_unit]
+    return scaled_intervals, selected_unit
+
 @st.cache_data(show_spinner=False)
 def read_timetag_file(file_bytes, chunk_size=10**6):
     """
@@ -95,7 +115,7 @@ def read_timetag_file(file_bytes, chunk_size=10**6):
     f.seek(header_size)  # Reset to position after header
 
     logging.info(f"Total records to read: {total_records}")
-
+    
     # Read data in chunks
     for chunk_num in range(0, total_records, chunk_size):
         records_to_read = min(chunk_size, total_records - chunk_num)
@@ -133,7 +153,6 @@ def read_timetag_file(file_bytes, chunk_size=10**6):
     else:
         return None, None
 
-
 @st.cache_data(show_spinner=False)
 def display_channel_distribution(channels):
     """
@@ -149,10 +168,9 @@ def display_channel_distribution(channels):
     channel_counts = dict(zip(unique_channels, counts))
     return channel_counts
 
-
 @st.cache_data(show_spinner=False)
 def find_start_stop_intervals(
-    timestamps, 
+    timestamps_ps, 
     channels, 
     start_channel, 
     stop_channels, 
@@ -164,7 +182,7 @@ def find_start_stop_intervals(
     Finds start-stop intervals between start and stop channels.
 
     Parameters:
-        timestamps (np.ndarray): Array of timestamps.
+        timestamps_ps (np.ndarray): Array of relative timestamps in picoseconds (starting from 0).
         channels (np.ndarray): Array of channel numbers.
         start_channel (int): Channel number designated as "start".
         stop_channels (list of int): List of channel numbers designated as "stop" channels.
@@ -185,13 +203,13 @@ def find_start_stop_intervals(
 
     # Extract start and stop events
     start_indices = np.where(channels == start_channel)[0]
-    start_times = timestamps[start_indices]
+    start_times = timestamps_ps[start_indices]
 
     # Dictionary to hold stop indices per channel
     stop_times_dict = {}
     for stop_ch in stop_channels:
         stop_indices = np.where(channels == stop_ch)[0]
-        stop_times = timestamps[stop_indices]
+        stop_times = timestamps_ps[stop_indices]
         stop_times_dict[stop_ch] = stop_times
 
         # Compute event rate for stop channel
@@ -236,7 +254,6 @@ def find_start_stop_intervals(
 
     return np.array(intervals), np.array(stop_times_paired), event_rates
 
-
 @st.cache_data(show_spinner=False)
 def outlier_detection(intervals, z_threshold=3.0):
     """
@@ -251,7 +268,7 @@ def outlier_detection(intervals, z_threshold=3.0):
     """
     if len(intervals) == 0:
         logging.warning("No intervals available for outlier detection.")
-        return intervals  # Early exit as per code review comment
+        return intervals  # Early exit
 
     mean = np.mean(intervals)
     std_dev = np.std(intervals)
@@ -265,7 +282,6 @@ def outlier_detection(intervals, z_threshold=3.0):
     logging.info(f"Removed {len(intervals) - len(cleaned_intervals)} outliers from data.")
     return cleaned_intervals
 
-
 @st.cache_data(show_spinner=False)
 def calculate_normalization(start_events, stop_events, bin_width, total_time_s):
     """
@@ -275,20 +291,24 @@ def calculate_normalization(start_events, stop_events, bin_width, total_time_s):
     Parameters:
         start_events (int): Number of start events.
         stop_events (int): Number of stop events.
-        bin_width (int): Width of each histogram bin in picoseconds.
+        bin_width (float): Width of each histogram bin in the selected unit.
         total_time_s (float): Total data collection time in seconds.
 
     Returns:
         float: Normalization factor.
     """
+    if bin_width is None:
+        logging.error("Bin width is None. Cannot calculate normalization factor.")
+        return None
+
+    W = bin_width * 1e-12  # bin_width in seconds
+
     R_start = start_events / total_time_s  # Events per second
     R_stop = stop_events / total_time_s    # Events per second
-    W = bin_width * 1e-12  # bin_width in seconds
 
     normalization_factor = R_start * R_stop * W * total_time_s
     logging.info(f"Normalization Factor: {normalization_factor:.6e}")
     return normalization_factor
-
 
 def export_intervals_to_csv(intervals, output_filename='intervals.csv'):
     """
@@ -324,6 +344,15 @@ This application processes binary TDC data files from quTAG devices, extracts st
 performs extensive data analysis including harmonic detection, and visualizes the results. It is optimized for large datasets,
 automatically computes the total measurement time from the data, and includes comprehensive logging for troubleshooting.
 """)
+
+# Define unit scaling early to be accessible throughout the code
+unit_scaling = {
+    'ps': 1,
+    'ns': 1e-3,
+    'μs': 1e-6,
+    'ms': 1e-9,
+    's': 1e-12
+}
 
 # Sidebar for user inputs
 st.sidebar.header("📁 Configuration")
@@ -365,30 +394,50 @@ with st.sidebar.expander("🔧 Configure Channels"):
     if len(stop_channels) != len(set(stop_channels)):
         st.error("❌ Duplicate stop channels detected. Each stop channel must be unique.")
 
-# Histogram parameters
+# Histogram parameters in the sidebar with enhanced settings
 with st.sidebar.expander("📊 Histogram Parameters"):
-    bin_size = st.number_input(
-        "Bin Size (ps)", 
-        min_value=1, 
-        max_value=1_000_000, 
-        value=1000, 
-        step=100
-    )
-    bin_range_input = st.text_input(
-        "Bin Range (min,max in ps)", 
-        value="0,10000", 
-        help="Enter two comma-separated values, e.g., 0,10000"
-    )
-    try:
-        bin_range = tuple(map(int, bin_range_input.split(',')))
-        if len(bin_range) != 2:
-            st.error("❌ Bin range must have exactly two values: min and max.")
-            bin_range = None
-    except:
-        st.error("❌ Invalid bin range format. Please enter two integers separated by a comma.")
-        bin_range = None
-
     normalize = st.checkbox("📏 Normalize Histogram", value=False)
+    
+    st.markdown("### 🔧 Customize Histogram Parameters")
+    
+    # Unit selection
+    time_units = ['ps', 'ns', 'μs', 'ms', 's']
+    selected_unit = st.selectbox("Select Time Unit for Histogram", options=time_units, index=0)
+    
+    # Histogram customization options
+    num_bins = st.number_input(
+        "Number of Bins",
+        min_value=1,
+        max_value=1000,
+        value=50,
+        step=1,
+        help="Define the number of bins for the histogram."
+    )
+    bin_range = st.checkbox("🖼️ Define Bin Range", value=False)
+    if bin_range:
+        bin_range_min = st.number_input(
+            f"Bin Range Minimum ({selected_unit})", 
+            min_value=0.0, 
+            max_value=1e12, 
+            value=0.0, 
+            step=0.1, 
+            format="%.2f",
+            help="Lower bound of the histogram."
+        )
+        bin_range_max = st.number_input(
+            f"Bin Range Maximum ({selected_unit})", 
+            min_value=0.0, 
+            max_value=1e12, 
+            value=1000.0, 
+            step=0.1, 
+            format="%.2f",
+            help="Upper bound of the histogram."
+        )
+        if bin_range_max <= bin_range_min:
+            st.error("❌ Bin Range Maximum must be greater than Bin Range Minimum.")
+    else:
+        bin_range_min = None
+        bin_range_max = None
 
 # Outlier removal settings
 with st.sidebar.expander("🎛️ Outlier Removal Settings"):
@@ -450,8 +499,9 @@ if run_analysis:
     total_time_s = total_time_ps * 1e-12  # Convert picoseconds to seconds
     st.info(f"🕒 **Total Measurement Time:** {total_time_s:.6f} seconds (Computed from data)")
 
-    # Convert timestamps to relative time in seconds
-    relative_timestamps = (timestamps - min_timestamp) * 1e-12  # Convert ps to seconds
+    # Convert timestamps to relative time in picoseconds and seconds
+    relative_timestamps_ps = timestamps - min_timestamp  # Relative timestamps in picoseconds
+    relative_timestamps_s = relative_timestamps_ps * 1e-12  # Convert to seconds
 
     # Display channel distribution
     with st.spinner("📊 Computing channel distribution..."):
@@ -481,12 +531,12 @@ if run_analysis:
 
     # Automatic downsampling
     MAX_TIMELINE_POINTS = 200000  # Adjust as needed
-    if len(relative_timestamps) > MAX_TIMELINE_POINTS:
-        sample_indices = np.random.choice(len(relative_timestamps), MAX_TIMELINE_POINTS, replace=False)
-        plot_timestamps = relative_timestamps[sample_indices]
+    if len(relative_timestamps_s) > MAX_TIMELINE_POINTS:
+        sample_indices = np.random.choice(len(relative_timestamps_s), MAX_TIMELINE_POINTS, replace=False)
+        plot_timestamps = relative_timestamps_s[sample_indices]
         plot_channels = channels[sample_indices]
     else:
-        plot_timestamps = relative_timestamps
+        plot_timestamps = relative_timestamps_s
         plot_channels = channels
 
     # Plot the event timeline with larger markers
@@ -507,7 +557,7 @@ if run_analysis:
     # Find start-stop intervals and monitor event rates
     with st.spinner("🔍 Identifying start-stop intervals..."):
         intervals, stop_times_paired, event_rates = find_start_stop_intervals(
-            timestamps,
+            relative_timestamps_ps,  # Pass relative timestamps in picoseconds
             channels,
             start_channel,
             stop_channels,
@@ -580,44 +630,57 @@ if run_analysis:
         if start_events == 0 or stop_events == 0:
             st.error("❌ Start or Stop events count is zero. Cannot perform normalization.")
             st.stop()
-        normalization_factor = calculate_normalization(
-            start_events,
-            stop_events,
-            bin_size,
-            total_time_s
-        )
+        # Since bin_width and total_time_s are not used in simplified histogram, normalization is handled via Plotly
+        st.info("📏 Normalization will be applied directly in the histogram plot.")
     else:
         st.info("📉 Normalization not enabled. Proceeding without normalization.")
 
     # Plot interval statistics using Plotly
     st.subheader("📊 Interval Statistics")
     if len(cleaned_intervals) > 0:
-        mean_interval = np.mean(cleaned_intervals) * 1e-3  # Convert to nanoseconds
-        median_interval = np.median(cleaned_intervals) * 1e-3  # Convert to nanoseconds
-        std_interval = np.std(cleaned_intervals) * 1e-3  # Convert to nanoseconds
-        st.write(f"**Mean Interval:** {mean_interval:.2f} ns")
-        st.write(f"**Median Interval:** {median_interval:.2f} ns")
-        st.write(f"**Standard Deviation:** {std_interval:.2f} ns")
+        # Determine appropriate time unit and scale intervals for histogram
+        scaled_intervals, unit_label = get_time_unit(cleaned_intervals, selected_unit)
+        
+        mean_interval = np.mean(scaled_intervals)
+        median_interval = np.median(scaled_intervals)
+        std_interval = np.std(scaled_intervals)
+        st.write(f"**Mean Interval:** {mean_interval:.2f} {unit_label}")
+        st.write(f"**Median Interval:** {median_interval:.2f} {unit_label}")
+        st.write(f"**Standard Deviation:** {std_interval:.2f} {unit_label}")
     else:
         st.warning("❗ No intervals available for statistical analysis.")
 
-    # Plot Interval Distribution without Statistics on the Plot
+    # Start-Stop Interval Distribution Histogram
     st.subheader("📈 Start-Stop Interval Distribution")
     if len(cleaned_intervals) > 0:
-        with st.spinner("📈 Generating Interval Distribution plot..."):
-            fig_distribution = px.histogram(
-                cleaned_intervals,  # Keep intervals in picoseconds
-                nbins=50,  # Adjusted for clarity
-                labels={'value': 'Interval Length (ps)'},
-                title='Start-Stop Interval Distribution',
-                color_discrete_sequence=['#1f77b4'],  # A distinct blue color
-                opacity=0.75,
-                marginal="box"  # Adds a box plot for summary statistics
-            )
-            if normalize and normalization_factor is not None:
-                fig_distribution.update_layout(yaxis_title='Normalized Counts')
+        # Convert intervals to selected unit
+        intervals_in_unit = cleaned_intervals * unit_scaling[selected_unit]
+        
+        # Prepare histogram arguments
+        hist_args = {
+            'x': intervals_in_unit,
+            'labels': {'x': f'Interval Length ({selected_unit})'},
+            'title': 'Start-Stop Interval Distribution',
+            'color_discrete_sequence': ['#1f77b4'],  # A distinct blue color
+            'opacity': 0.75,
+            'marginal': "box",  # Adds a box plot for summary statistics
+            'nbins': int(num_bins),
+        }
+
+        if bin_range and bin_range_min is not None and bin_range_max is not None:
+            if bin_range_max <= bin_range_min:
+                st.error("❌ Bin Range Maximum must be greater than Bin Range Minimum.")
             else:
-                fig_distribution.update_layout(yaxis_title='Counts')
+                hist_args['range_x'] = [bin_range_min, bin_range_max]
+        
+        if normalize:
+            hist_args['histnorm'] = 'probability density'
+        else:
+            hist_args['histnorm'] = None  # Let Plotly default to 'count'
+        
+        # Plot the histogram with user-defined binning
+        with st.spinner("📈 Generating Interval Distribution plot..."):
+            fig_distribution = px.histogram(**hist_args)
             
             # Enhance layout for better aesthetics
             fig_distribution.update_layout(
@@ -627,28 +690,28 @@ if run_analysis:
                     'x':0.5,
                     'xanchor': 'center',
                     'yanchor': 'top'},
-                xaxis_title='Interval Length (ps)',
-                yaxis_title='Counts',
+                xaxis_title=f'Interval Length ({selected_unit})',
+                yaxis_title='Density' if normalize else 'Counts',
                 template='plotly_white',
                 bargap=0.1,  # Slightly increased gap for better separation
                 hovermode="x unified"
             )
             
             st.plotly_chart(fig_distribution, use_container_width=True)
-    else:
-        st.warning("❗ No intervals available to plot distribution.")
 
     # Function to plot paired events scatter plot
     def plot_paired_scatter():
         with st.spinner("📈 Generating Paired Events Scatter Plot..."):
+            # Convert intervals to selected unit
+            intervals_in_unit = cleaned_intervals * unit_scaling[selected_unit]
             fig_paired = go.Figure(
                 data=go.Scattergl(
                     x=cleaned_stop_times * 1e-12,  # Convert to seconds
-                    y=cleaned_intervals,           # Keep intervals in picoseconds
+                    y=intervals_in_unit,           # Scale intervals to selected unit
                     mode='markers',
                     marker=dict(
                         size=5,
-                        color=cleaned_intervals,   # Color by interval in ps
+                        color=intervals_in_unit,   # Color by interval in selected unit
                         colorscale='Viridis',
                         showscale=True,
                         opacity=0.6
@@ -659,7 +722,7 @@ if run_analysis:
             fig_paired.update_layout(
                 title='Paired Start-Stop Intervals Over Time',
                 xaxis_title='Stop Event Relative Timestamp (s)',
-                yaxis_title='Interval Length (ps)',
+                yaxis_title=f'Interval Length ({selected_unit})',
                 template='plotly_white'
             )
             st.plotly_chart(fig_paired, use_container_width=True)
@@ -667,12 +730,14 @@ if run_analysis:
     # Function to plot hexbin plot
     def plot_paired_hexbin():
         with st.spinner("📈 Generating Paired Events Hexbin Plot..."):
+            # Convert intervals to selected unit
+            intervals_in_unit = cleaned_intervals * unit_scaling[selected_unit]
             fig_hex = px.density_heatmap(
                 x=cleaned_stop_times * 1e-12,  # Convert to seconds
-                y=cleaned_intervals,           # Keep intervals in picoseconds
+                y=intervals_in_unit,           # Scale intervals to selected unit
                 nbinsx=100,
                 nbinsy=100,
-                labels={'x': 'Stop Event Relative Timestamp (s)', 'y': 'Interval Length (ps)'},
+                labels={'x': 'Stop Event Relative Timestamp (s)', 'y': f'Interval Length ({selected_unit})'},
                 title='Paired Start-Stop Intervals Hexbin Density',
                 color_continuous_scale='Viridis'
             )
@@ -700,10 +765,10 @@ if run_analysis:
     if len(cleaned_intervals) > MAX_VARIATION_POINTS:
         sample_indices_var = np.random.choice(len(cleaned_intervals), MAX_VARIATION_POINTS, replace=False)
         plot_stop_times_var = cleaned_stop_times[sample_indices_var] * 1e-12  # Convert to seconds
-        plot_intervals_var = cleaned_intervals[sample_indices_var]           # Keep in picoseconds
+        plot_intervals_var = cleaned_intervals[sample_indices_var] * unit_scaling[selected_unit]  # Scale to selected unit
     else:
         plot_stop_times_var = cleaned_stop_times * 1e-12  # Convert to seconds
-        plot_intervals_var = cleaned_intervals           # Keep in picoseconds
+        plot_intervals_var = cleaned_intervals * unit_scaling[selected_unit]  # Scale to selected unit
 
     if len(plot_intervals_var) > 0:
         with st.spinner("📈 Generating Interval Variation Over Time plot..."):
@@ -714,7 +779,7 @@ if run_analysis:
                     mode='markers',
                     marker=dict(
                         size=5,
-                        color=plot_intervals_var,    # Color by interval in ps
+                        color=plot_intervals_var,    # Color by interval in selected unit
                         colorscale='Plasma',
                         showscale=True,
                         opacity=0.6
@@ -725,7 +790,7 @@ if run_analysis:
             fig_variation.update_layout(
                 title='Variation of Start-Stop Intervals Over Time',
                 xaxis_title='Stop Event Relative Timestamp (s)',
-                yaxis_title='Interval Length (ps)',
+                yaxis_title=f'Interval Length ({selected_unit})',
                 template='plotly_white'
             )
             st.plotly_chart(fig_variation, use_container_width=True)
